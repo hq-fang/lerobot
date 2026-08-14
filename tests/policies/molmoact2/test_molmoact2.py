@@ -1793,7 +1793,7 @@ def test_train_mode_vlm_freeze_requires_continuous_action_mode():
     with pytest.raises(ValueError, match="requires action_mode='continuous'"):
         MolmoAct2Config(action_mode="both", train_mode_vlm="freeze")
 
-    cfg = MolmoAct2Config(action_mode="continuous", train_mode_vlm="freeze")
+    cfg = MolmoAct2Config(action_mode="continuous", train_mode_vlm="freeze")  # trufflehog:ignore
     assert cfg.train_mode_vlm == "freeze"
 
 
