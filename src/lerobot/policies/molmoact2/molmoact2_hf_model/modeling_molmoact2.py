@@ -403,6 +403,16 @@ class ActionExpertCrossAttention(nn.Module):
             q = self.q_norm(q)
         q = q.transpose(1, 2)
         k = k.transpose(1, 2)
+        if k.shape[0] != bsz:
+            # Flow samples have independent queries but share the same VLM
+            # prefix. Concatenate their query positions instead of copying K/V
+            # F times. Softmax is over keys, so flows cannot attend to each other.
+            context_batch = k.shape[0]
+            if bsz % context_batch != 0 or v.shape[0] != context_batch:
+                raise ValueError("Cross-attention query batch must be a multiple of the shared KV batch")
+            if attn_mask is not None and (attn_mask.shape[0] != context_batch or attn_mask.shape[-2] != 1):
+                raise ValueError("Shared flow KV requires one key-only mask per context example")
+            q = q.reshape(context_batch, (bsz // context_batch) * tgt_len, self.num_heads, self.head_dim)
         out = self._attention(q, k, v, attn_mask=attn_mask)
         out = out.reshape(bsz, tgt_len, self.hidden_size)
         return self.out_drop(self.out_proj(out))
@@ -2122,6 +2132,30 @@ def eager_attention_forward(
     return attn_output.to(dtype=output_dtype), attn_weights
 
 
+def _text_sdpa(query, key, value, attention_mask, dropout_p, *, native_gqa=False):
+    """Preserve the caller's exact mask while optionally avoiding repeated K/V."""
+    if native_gqa:
+        with sdpa_kernel(SDPBackend.CUDNN_ATTENTION):
+            return F.scaled_dot_product_attention(
+                query,
+                key,
+                value,
+                attn_mask=attention_mask,
+                dropout_p=dropout_p,
+                is_causal=attention_mask is None,
+                enable_gqa=True,
+            )
+    groups = query.shape[1] // key.shape[1]
+    return F.scaled_dot_product_attention(
+        query,
+        repeat_kv(key, groups),
+        repeat_kv(value, groups),
+        attn_mask=attention_mask,
+        dropout_p=dropout_p,
+        is_causal=attention_mask is None,
+    )
+
+
 class MolmoAct2Attention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
@@ -2129,6 +2163,7 @@ class MolmoAct2Attention(nn.Module):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
+        self.training_native_gqa = False
         self.num_heads = config.num_attention_heads
         self.num_key_value_heads = config.num_key_value_heads
         self.num_key_value_groups = config.num_attention_heads // config.num_key_value_heads
@@ -2222,18 +2257,22 @@ class MolmoAct2Attention(nn.Module):
         if self.config._attn_implementation == "sdpa" and (
             attention_mask is None or torch.is_tensor(attention_mask)
         ):
-            key_states = repeat_kv(key_states, self.num_key_value_groups)
-            value_states = repeat_kv(value_states, self.num_key_value_groups)
-            # Keep Q/K/V in the autocast activation dtype so BF16 Flash/cuDNN
-            # SDPA remains available. Fused SDPA performs its sensitive
-            # reductions internally without materializing an fp32 QKV copy.
-            attn_output = F.scaled_dot_product_attention(
+            # Training-only opt-in; ordinary inference and FP32 reference math
+            # keep the existing attention path. cuDNN does not support dropout.
+            native_gqa = (
+                self.training_native_gqa
+                and self.training
+                and query_states.is_cuda
+                and query_states.dtype == torch.bfloat16
+                and dropout_p == 0.0
+            )
+            attn_output = _text_sdpa(
                 query_states,
                 key_states,
                 value_states,
-                attn_mask=attention_mask,
-                dropout_p=dropout_p,
-                is_causal=attention_mask is None,
+                attention_mask,
+                dropout_p,
+                native_gqa=native_gqa,
             )
             attn_output = attn_output.transpose(1, 2).contiguous()
             attn_weights = None
@@ -2315,6 +2354,7 @@ class MolmoAct2DecoderLayer(GradientCheckpointingLayer):
         **kwargs: Unpack[TransformersKwargs],
     ) -> tuple[torch.FloatTensor, tuple[torch.FloatTensor, torch.FloatTensor] | None]:
         collect_layer_kv_states = bool(kwargs.pop("collect_layer_kv_states", False))
+        return_hidden_states = bool(kwargs.pop("return_hidden_states", True))
 
         residual = hidden_states
         hidden_states = self.attn_norm(hidden_states)
@@ -2344,7 +2384,9 @@ class MolmoAct2DecoderLayer(GradientCheckpointingLayer):
 
         hidden_states = residual + self.dropout(hidden_states)
 
-        outputs = (hidden_states,)
+        # Continuous regional training needs only K/V at its final text block.
+        # Ordinary language forward/inference retains hidden states by default.
+        outputs = (hidden_states if return_hidden_states else None,)
 
         if output_attentions:
             outputs += (self_attn_weights,)
@@ -2368,6 +2410,7 @@ class MolmoAct2PostNormDecoderLayer(MolmoAct2DecoderLayer):
         **kwargs,
     ) -> tuple[torch.FloatTensor, tuple[torch.FloatTensor, torch.FloatTensor] | None]:
         collect_layer_kv_states = bool(kwargs.pop("collect_layer_kv_states", False))
+        return_hidden_states = bool(kwargs.pop("return_hidden_states", True))
 
         residual = hidden_states
 
@@ -2397,7 +2440,9 @@ class MolmoAct2PostNormDecoderLayer(MolmoAct2DecoderLayer):
 
         hidden_states = residual + self.dropout(hidden_states)
 
-        outputs = (hidden_states,)
+        # Continuous regional training needs only K/V at its final text block.
+        # Ordinary language forward/inference retains hidden states by default.
+        outputs = (hidden_states if return_hidden_states else None,)
 
         if output_attentions:
             outputs += (self_attn_weights,)

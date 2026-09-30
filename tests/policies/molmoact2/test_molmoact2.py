@@ -2214,6 +2214,73 @@ def test_molmoact2_compile_applies_precision_safe_action_partition(monkeypatch):
         assert module.compile_calls == []
 
 
+def test_molmoact2_fp32_master_compiles_joint_training_without_changing_checkpoint_keys(monkeypatch):
+    import torch._dynamo.config as dynamo_config
+    import torch._functorch.config as functorch_config
+
+    policy = _make_compile_test_policy()
+    policy.config.model_params_fp32 = True
+    policy.config.action_mode = "continuous"
+    original = policy._compute_continuous_flow_loss
+    keys = tuple(policy.state_dict())
+    calls = []
+
+    def record_compile(function, **kwargs):
+        calls.append((function, kwargs))
+        return function
+
+    monkeypatch.setattr(torch, "compile", record_compile)
+    monkeypatch.setattr(torch, "set_float32_matmul_precision", lambda _: None)
+    monkeypatch.setattr(molmoact2_modeling, "_set_dynamo_lru_cache", lambda _: None)
+    monkeypatch.setattr(molmoact2_modeling, "_disable_dynamo_ddp_optimizer", lambda: None)
+    monkeypatch.setattr(dynamo_config, "capture_dynamic_output_shape_ops", False)
+    monkeypatch.setattr(functorch_config, "backward_pass_autocast", "same_as_forward")
+    policy._apply_compile()
+    policy._apply_compile()
+
+    assert len(calls) == 1
+    assert calls[0][0] == original
+    assert calls[0][1] == {
+        "backend": "inductor",
+        "fullgraph": False,
+        "options": {
+            "emulate_precision_casts": True,
+            "comprehensive_padding": False,
+            "shape_padding": False,
+            "eager_numerics.division_rounding": True,
+            "fallback_random": True,
+        },
+    }
+    assert policy._compiled_module_names == ("joint_flow_training",)
+    assert tuple(policy.state_dict()) == keys
+    assert dynamo_config.capture_dynamic_output_shape_ops is True
+    assert functorch_config.backward_pass_autocast == "off"
+    assert all(not module.compile_calls for module in policy.modules() if hasattr(module, "compile_calls"))
+
+
+@pytest.mark.parametrize("graph_break", [False, True])
+def test_continuous_compile_does_not_materialize_unused_hidden_state_gradients(graph_break):
+    policy = _make_compile_test_policy()
+    active = policy.model.model.action_expert.action_embed.weight
+    unused = policy.model.lm_head.weight
+
+    def helper(*, return_hidden_states=True, **_):
+        if graph_break:
+            torch._dynamo.graph_break()
+        return active.square().sum(), unused.square() if return_hidden_states else None
+
+    policy._compute_flow_matching_loss_joint_per_layer = helper
+    compiled_loss = torch.compile(
+        policy._compute_continuous_flow_loss, backend="aot_eager", fullgraph=not graph_break
+    )
+
+    loss = compiled_loss(batch={}, model_inputs={})
+    loss.backward()
+
+    torch.testing.assert_close(active.grad, 2 * active.detach())
+    assert unused.grad is None
+
+
 def test_molmoact2_compile_uses_automatic_shapes_without_gradient_checkpointing(monkeypatch):
     policy = _make_compile_test_policy(gradient_checkpointing=False)
     backbone = policy._backbone()
@@ -3848,3 +3915,258 @@ def test_freeze_embedding_rejects_tied_lm_head_without_mutating():
         policy._freeze_input_embeddings()
 
     assert policy.model.model.embed.weight.requires_grad
+
+
+@pytest.mark.parametrize("flows", [1, 2, 8])
+def test_shared_flow_cross_attention_matches_expanded_values_and_gradients(flows):
+    import copy
+
+    from lerobot.policies.molmoact2.molmoact2_hf_model.modeling_molmoact2 import ActionExpertCrossAttention
+
+    torch.manual_seed(712)
+    expanded = ActionExpertCrossAttention(8, 2, qk_norm=False).double()
+    shared = copy.deepcopy(expanded)
+    batch, horizon, context = 2, 3, 7
+    query = torch.randn(batch * flows, horizon, 8, dtype=torch.float64, requires_grad=True)
+    key = torch.randn(batch, context, 2, 4, dtype=torch.float64, requires_grad=True)
+    value = torch.randn_like(key, requires_grad=True)
+    query_shared = query.detach().clone().requires_grad_()
+    key_shared = key.detach().clone().requires_grad_()
+    value_shared = value.detach().clone().requires_grad_()
+    mask = torch.ones(batch, 1, 1, context, dtype=torch.bool)
+    mask[0, :, :, -2:] = False
+    upstream = torch.randn_like(query)
+
+    reference = expanded(
+        query,
+        kv_k=key.repeat_interleave(flows, dim=0),
+        kv_v=value.repeat_interleave(flows, dim=0),
+        attn_mask=mask.repeat_interleave(flows, dim=0),
+    )
+    actual = shared(query_shared, kv_k=key_shared, kv_v=value_shared, attn_mask=mask)
+    reference.backward(upstream)
+    actual.backward(upstream)
+
+    torch.testing.assert_close(actual, reference, rtol=1e-10, atol=1e-10)
+    for old, new in ((query, query_shared), (key, key_shared), (value, value_shared)):
+        torch.testing.assert_close(new.grad, old.grad, rtol=1e-10, atol=1e-10)
+    for old, new in zip(expanded.parameters(), shared.parameters(), strict=True):
+        torch.testing.assert_close(new.grad, old.grad, rtol=1e-10, atol=1e-10)
+
+
+@pytest.mark.parametrize("scaled_layers", [False, True])
+def test_compiled_training_prepares_rotary_cache_without_mutating_it_on_repeat(scaled_layers):
+    policy = _make_compile_test_policy()
+    policy._compiled_module_names = ("joint_flow_training",)
+    config = hf_molmoact2_modeling.MolmoAct2TextConfig(
+        hidden_size=32,
+        num_attention_heads=4,
+        num_key_value_heads=4,
+        intermediate_size=64,
+        num_hidden_layers=1,
+        max_position_embeddings=64,
+    )
+    embedding = hf_molmoact2_modeling.MolmoAct2RotaryEmbedding(config)
+    transformer = policy._backbone().transformer
+    transformer.config = SimpleNamespace(rope_scaling_layers=[0] if scaled_layers else None)
+    if scaled_layers:
+        transformer.rotary_embs = torch.nn.ModuleDict(
+            {"default": embedding, "scaling": copy.deepcopy(embedding)}
+        )
+        embeddings = tuple(transformer.rotary_embs.values())
+    else:
+        transformer.rotary_emb = embedding
+        embeddings = (embedding,)
+    inputs = {"input_ids": torch.zeros(2, 12, dtype=torch.long)}
+    keys = tuple(policy.state_dict())
+    policy._prepare_compiled_training_cache(inputs)
+    buffers = [(e._pos_sin_cache, e._pos_cos_cache) for e in embeddings]
+    policy._prepare_compiled_training_cache(inputs)
+    for e, (sin, cos) in zip(embeddings, buffers, strict=True):
+        assert e._pos_sin_cache is sin and e._pos_cos_cache is cos
+        assert sin.shape[-2] == 64 and torch.isfinite(sin).all()
+    assert tuple(policy.state_dict()) == keys
+
+
+@pytest.mark.parametrize("with_masks", [False, True])
+def test_continuous_loss_compile_boundary_excludes_raw_images_and_preserves_masks(with_masks):
+    policy = _make_compile_test_policy()
+    policy.config.action_mode = "continuous"
+    model_inputs = {"input_ids": torch.ones(2, 5, dtype=torch.long)}
+    policy._model_inputs = lambda _: model_inputs
+    batch = {ACTION: torch.randn(2, 3, 4), "observation.images.top": [torch.zeros(3, 224, 224)]}
+    if with_masks:
+        batch["action_dim_is_pad"] = torch.zeros(2, 4, dtype=torch.bool)
+        batch["action_horizon_is_pad"] = torch.zeros(2, 3, dtype=torch.bool)
+    calls = []
+
+    def loss_function(**kwargs):
+        calls.append(kwargs)
+        return kwargs["batch"][ACTION].square().mean()
+
+    policy._compute_continuous_flow_loss = loss_function
+    loss, _ = policy._forward_impl(batch)
+    torch.testing.assert_close(loss, batch[ACTION].square().mean())
+    assert calls[0]["model_inputs"] is model_inputs
+    assert set(calls[0]["batch"]) == set(batch) - {"observation.images.top"}
+    assert all(value is batch[key] for key, value in calls[0]["batch"].items())
+
+
+@pytest.mark.parametrize("action_mode", ["continuous", "both"])
+@pytest.mark.parametrize("flows", [1, 4, 8])
+@pytest.mark.parametrize("fp32_master", [True, False])
+def test_regional_compile_preserves_checkpoint_keys_and_checkpoint_boundaries(
+    monkeypatch, action_mode, flows, fp32_master
+):
+    policy = _make_compile_test_policy()
+    policy.config.model_params_fp32 = fp32_master
+    policy.config.action_mode = action_mode
+    policy.config.num_flow_timesteps = flows
+    policy.config.compile_scope = "regional"
+    keys = tuple(policy.state_dict())
+    loss_function = policy._compute_continuous_flow_loss
+    monkeypatch.setattr(torch, "set_float32_matmul_precision", lambda _: None)
+    monkeypatch.setattr(molmoact2_modeling, "_set_dynamo_lru_cache", lambda _: None)
+    monkeypatch.setattr(molmoact2_modeling, "_disable_dynamo_ddp_optimizer", lambda: None)
+    policy._apply_compile()
+    policy._apply_compile()
+    assert tuple(policy.state_dict()) == keys
+    assert policy._compute_continuous_flow_loss == loss_function
+    assert len(policy._compiled_module_names) == 8
+    backbone = policy._backbone()
+    for block in [
+        *backbone.transformer.blocks,
+        *backbone.action_expert.blocks,
+        *backbone.vision_backbone.image_vit.transformer.resblocks,
+        backbone.vision_backbone.image_pooling_2d,
+        backbone.vision_backbone.image_projector,
+    ]:
+        assert len(block.compile_calls) == 1
+    assert not backbone.transformer.input_embeddings.compile_calls
+
+
+@pytest.mark.parametrize("layer_name", ["MolmoAct2DecoderLayer", "MolmoAct2PostNormDecoderLayer"])
+def test_regional_final_text_output_preserves_none_gradients_and_normal_inference(layer_name):
+    config = hf_molmoact2_modeling.MolmoAct2TextConfig(
+        hidden_size=16,
+        intermediate_size=32,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=4,
+        num_hidden_layers=1,
+        residual_dropout=0.0,
+        attention_dropout=0.0,
+    )
+    config._attn_implementation = "sdpa"
+    layer = getattr(hf_molmoact2_modeling, layer_name)(config, 0)
+    hidden = torch.randn(1, 4, 16)
+    position = (torch.ones(1, 4, 4), torch.zeros(1, 4, 4))
+    kwargs = {"position_embeddings": position, "collect_layer_kv_states": True}
+    normal = layer(hidden, **kwargs)
+    assert normal[0].shape == hidden.shape
+    eager = layer(hidden, return_hidden_states=False, **kwargs)
+    assert eager[0] is None
+    (eager[1].square().sum() + eager[2].square().sum()).backward()
+    reference = {n: p.grad.clone() for n, p in layer.named_parameters() if p.grad is not None}
+    layer.zero_grad(set_to_none=True)
+    compiled = torch.compile(layer, backend="aot_eager", fullgraph=True)
+    result = compiled(hidden, return_hidden_states=False, **kwargs)
+    assert result[0] is None
+    (result[1].square().sum() + result[2].square().sum()).backward()
+    assert {n for n, p in layer.named_parameters() if p.grad is not None} == set(reference)
+    assert all(p.grad is None for p in layer.mlp.parameters())
+    for n, p in layer.named_parameters():
+        if n in reference:
+            torch.testing.assert_close(p.grad, reference[n])
+    # Training optimization must not drop ordinary language/inference outputs.
+    with torch.no_grad():
+        after = compiled(hidden, **kwargs)
+    torch.testing.assert_close(after[0], normal[0])
+
+
+@pytest.mark.parametrize("mask_kind", ["causal", "left_padding", "fully_masked"])
+def test_native_gqa_preserves_attention_mask_outputs_and_gradients(monkeypatch, mask_kind):
+    from contextlib import nullcontext
+
+    # CPU math SDPA validates grouping/mask semantics independently of cuDNN
+    # kernel rounding. The real CUDA backend is exercised by the GPU benchmark.
+    backends = []
+
+    def context(backend):
+        backends.append(backend)
+        return nullcontext()
+
+    monkeypatch.setattr(hf_molmoact2_modeling, "sdpa_kernel", context)
+    torch.manual_seed(50)
+    q = torch.randn(2, 4, 5, 4, dtype=torch.float64, requires_grad=True)
+    k = torch.randn(2, 2, 5, 4, dtype=torch.float64, requires_grad=True)
+    v = torch.randn(2, 2, 5, 4, dtype=torch.float64, requires_grad=True)
+    mask = None
+    if mask_kind != "causal":
+        mask = torch.ones(2, 1, 5, 5, dtype=torch.bool).tril()
+        mask[0, :, :, :2] = False
+        if mask_kind == "fully_masked":
+            mask[1] = False
+    expected = hf_molmoact2_modeling._text_sdpa(q, k, v, mask, 0.0)
+    expected_grad = torch.autograd.grad(expected.square().sum(), (q, k, v))
+    actual = hf_molmoact2_modeling._text_sdpa(q, k, v, mask, 0.0, native_gqa=True)
+    actual_grad = torch.autograd.grad(actual.square().sum(), (q, k, v))
+    assert len(backends) == 1
+    torch.testing.assert_close(actual, expected, atol=1e-10, rtol=1e-10)
+    for a, b in zip(actual_grad, expected_grad, strict=True):
+        torch.testing.assert_close(a, b, atol=1e-10, rtol=1e-10)
+
+
+def test_native_gqa_flag_preserves_regular_inference(monkeypatch):
+    config = hf_molmoact2_modeling.MolmoAct2TextConfig(
+        hidden_size=16,
+        intermediate_size=32,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=4,
+        num_hidden_layers=1,
+        residual_dropout=0.0,
+        attention_dropout=0.0,
+    )
+    config._attn_implementation = "sdpa"
+    layer = hf_molmoact2_modeling.MolmoAct2Attention(config, 0).eval()
+    hidden = torch.randn(1, 4, 16)
+    position = (torch.ones(1, 4, 4), torch.zeros(1, 4, 4))
+    reference = layer(hidden, position, None)[0]
+    layer.training_native_gqa = True
+    original = hf_molmoact2_modeling._text_sdpa
+
+    def record(*args, **kwargs):
+        assert kwargs.get("native_gqa") is False
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(hf_molmoact2_modeling, "_text_sdpa", record)
+    torch.testing.assert_close(layer(hidden, position, None)[0], reference)
+
+
+@pytest.mark.parametrize("fp32_master", [False, True])
+@pytest.mark.parametrize("action_mode", ["continuous", "both"])
+def test_regional_config_accepts_supported_objectives_and_storage(fp32_master, action_mode):
+    config = MolmoAct2Config(
+        compile_model=True, compile_scope="regional", model_params_fp32=fp32_master, action_mode=action_mode
+    )
+    assert config.compile_scope == "regional"
+
+
+def test_regional_config_rejects_discrete_only_and_unknown_scope():
+    with pytest.raises(ValueError, match="continuous or joint"):
+        MolmoAct2Config(compile_model=True, compile_scope="regional", action_mode="discrete")
+    with pytest.raises(ValueError, match="compile_scope"):
+        MolmoAct2Config(compile_scope="unknown")
+
+
+def test_fp32_master_storage_preserves_freeze_flags():
+    policy = _make_compile_test_policy()
+    policy.model.to(dtype=torch.bfloat16)
+    param = next(policy.model.parameters())
+    param.requires_grad_(False)
+    flags = [p.requires_grad for p in policy.model.parameters()]
+    policy.config.model_params_fp32 = True
+    policy._apply_bfloat16_parameter_policy()
+    assert all(p.dtype == torch.float32 for p in policy.model.parameters())
+    assert [p.requires_grad for p in policy.model.parameters()] == flags
