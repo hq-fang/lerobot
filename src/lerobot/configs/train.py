@@ -130,6 +130,8 @@ class TrainPipelineConfig(HubMixin):
     cudnn_deterministic: bool = False
     # Number of workers for the dataloader.
     num_workers: int = 4
+    # Pack MolmoAct2 images/tokens in CPU workers while the GPU trains.
+    molmoact2_worker_preprocess: bool = False
     batch_size: int = 8
     prefetch_factor: int = 4
     persistent_workers: bool = True
