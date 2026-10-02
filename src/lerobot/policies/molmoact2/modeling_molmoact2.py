@@ -54,6 +54,7 @@ from lerobot.utils.import_utils import (
 )
 
 from ..rtc.modeling_rtc import RTCProcessor
+from .compile_norms import preserve_native_norms
 from .configuration_molmoact2 import MolmoAct2Config
 from .utils_molmoact2 import (
     hf_token as _hf_token,
@@ -1065,6 +1066,7 @@ class MolmoAct2Policy(PreTrainedPolicy):
                 "fallback_random": True,
             }
             if getattr(self.config, "compile_scope", "full") == "regional":
+                self._native_norm_module_names = preserve_native_norms(self)
                 backbone = self._backbone()
                 targets: list[tuple[str, torch.nn.Module]] = []
                 for prefix, modules in (
