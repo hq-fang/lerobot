@@ -350,10 +350,14 @@ class MolmoAct2Config(PreTrainedConfig):
     enable_knowledge_insulation: bool = False
     freeze_embedding: bool = True
     gradient_checkpointing: bool = False
-    # Pi0.5-style public switch backed by MolmoAct2's official block-wise
-    # compilation strategy. The policy intentionally keeps the compiler
-    # backend/scope internal so there is only one supported execution plan.
+    # Regional mode compiles vision, connector, language and action blocks.
+    # The default full scope preserves the legacy hybrid action-block boundary;
+    # FP32-master continuous training can instead compile the joint loss path.
     compile_model: bool = False
+    # Regional compilation leaves activation-checkpoint scheduling outside the graphs.
+    compile_scope: str = "full"
+    # Opt-in cuDNN grouped-query attention for BF16 CUDA training only.
+    training_native_gqa: bool = False
 
     # Pi0.5-style precision switch controlling parameter storage and autocast.
     # ``bfloat16`` stores large text and vision matrices in bf16 while the full
@@ -362,6 +366,8 @@ class MolmoAct2Config(PreTrainedConfig):
     # math.
     # ``float32`` keeps both the full model and compute in fp32.
     dtype: torch.dtype | None = torch.bfloat16
+    # Opt-in FP32 parameter/Adam storage while dtype continues to select compute.
+    model_params_fp32: bool = False
     # Official fine-tuning from the released ``allenai/MolmoAct2`` HF base
     # explicitly applies unmasked residual dropout 0.1 and disables the
     # response-only variant.  The converted HF decoder therefore matches the
@@ -398,6 +404,14 @@ class MolmoAct2Config(PreTrainedConfig):
 
     def __post_init__(self) -> None:
         super().__post_init__()
+        if self.compile_scope not in {"full", "regional"}:
+            raise ValueError("compile_scope must be 'full' or 'regional'")
+        if (
+            self.compile_model
+            and self.compile_scope == "regional"
+            and self.action_mode not in {"continuous", "both"}
+        ):
+            raise ValueError("Regional compilation requires continuous or joint training")
         if (self.joint_signs is None) != (self.joint_offsets is None):
             raise ValueError("joint_signs and joint_offsets must both be set or both be None.")
         if (

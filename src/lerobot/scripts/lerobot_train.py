@@ -642,6 +642,29 @@ def train(cfg: TrainPipelineConfig) -> None:
 
     dataloader, eval_dataloader = make_dataloaders(cfg, dataset, eval_dataset, step, parallel_dims)
 
+    prepared_to_device = None
+    if cfg.molmoact2_worker_preprocess:
+        if active_cfg.type != "molmoact2" or cfg.rename_map:
+            raise ValueError("Worker preprocessing requires MolmoAct2 without a rename map")
+        from lerobot.policies.molmoact2.worker_preprocessing import (
+            PreparedMolmoAct2Collator,
+            device_only,
+            init_molmoact2_cpu_worker,
+        )
+
+        dataloader.collate_fn = PreparedMolmoAct2Collator(
+            policy.config,
+            dict(processor_kwargs),
+            pretrained_path=processor_pretrained_path,
+            pretrained_revision=active_cfg.pretrained_revision,
+            collate_fn=dataloader.collate_fn,
+            camera_keys=dataset.meta.camera_keys,
+        )
+        dataloader.worker_init_fn = init_molmoact2_cpu_worker
+        if cfg.num_workers == 0:
+            init_molmoact2_cpu_worker(0)
+        prepared_to_device = device_only(preprocessor)
+
     # --- prepare & resume phase 2 ---------------------------------------------------------------
     # The FSDP wrap-unit class names resolve right before prepare: user override, else the
     # policy's _fsdp_wrap_modules declaration — root-only wrapping is never silently accepted.
@@ -817,7 +840,11 @@ def train(cfg: TrainPipelineConfig) -> None:
         batch = next(dl_iter)
         preprocessing_start = time.perf_counter()
         train_tracker.dataloading_s = preprocessing_start - step_start
-        batch = _preprocess_dataset_batch(batch, dataset.meta.camera_keys, cfg.rename_map, preprocessor)
+        batch = (
+            prepared_to_device(batch)
+            if prepared_to_device is not None
+            else _preprocess_dataset_batch(batch, dataset.meta.camera_keys, cfg.rename_map, preprocessor)
+        )
         train_tracker.preprocessing_s = time.perf_counter() - preprocessing_start
 
         train_tracker, _ = update_policy(

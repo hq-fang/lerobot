@@ -54,6 +54,7 @@ from lerobot.utils.import_utils import (
 )
 
 from ..rtc.modeling_rtc import RTCProcessor
+from .compile_norms import preserve_native_norms
 from .configuration_molmoact2 import MolmoAct2Config
 from .utils_molmoact2 import (
     hf_token as _hf_token,
@@ -658,6 +659,9 @@ class MolmoAct2Policy(PreTrainedPolicy):
         _validate_inference_action_mode(self.config, self._checkpoint_action_mode)
         if self.config.train_mode_vlm == "lora":
             self._apply_lora_adapters()
+        if self.config.training_native_gqa:
+            for block in self._backbone().transformer.blocks:
+                block.self_attn.training_native_gqa = True
         self._apply_compile()
         self.init_rtc_processor()
 
@@ -669,7 +673,7 @@ class MolmoAct2Policy(PreTrainedPolicy):
             revision=self.config.checkpoint_revision,
             force_download=bool(self.config.checkpoint_force_download),
         )
-        storage_dtype = self.config.dtype
+        storage_dtype = torch.float32 if self.config.model_params_fp32 else self.config.dtype
         if HFMolmoAct2Config is None or MolmoAct2ForConditionalGeneration is None:
             raise RuntimeError("transformers is required to load MolmoAct2 checkpoints.")
         hf_config = HFMolmoAct2Config.from_pretrained(
@@ -855,6 +859,9 @@ class MolmoAct2Policy(PreTrainedPolicy):
         parameters and therefore fp32 Adam state when trainable. Eligible
         action-expert operators still execute in bf16 under autocast.
         """
+        if getattr(self.config, "model_params_fp32", False):
+            self.model.to(dtype=torch.float32)
+            return
         if self.config.dtype != torch.bfloat16:
             return
 
@@ -981,7 +988,7 @@ class MolmoAct2Policy(PreTrainedPolicy):
         return self._hf_model().model
 
     def _iter_compile_targets(self) -> Iterator[tuple[str, torch.nn.Module, bool | None]]:
-        """Yield the numerically validated MolmoAct2 training compile boundary.
+        """Yield the legacy low-memory parameter-storage compile boundary.
 
         The outer policy/model forwards intentionally remain eager: multimodal
         packing, action-span handling, and metrics contain data-dependent Python
@@ -1007,7 +1014,7 @@ class MolmoAct2Policy(PreTrainedPolicy):
             yield f"action_expert.blocks.{index}", block, sequence_dynamic
 
     def _apply_compile(self) -> None:
-        """Install official-style block compilation when explicitly enabled."""
+        """Compile flow/joint regions for either storage mode, or legacy action blocks."""
         if not self.config.compile_model or self._compile_applied:
             return
         if not hasattr(torch.nn.Module, "compile"):
@@ -1027,6 +1034,58 @@ class MolmoAct2Policy(PreTrainedPolicy):
             _disable_dynamo_ddp_optimizer()
 
         torch.set_float32_matmul_precision("high")
+        if (
+            getattr(self.config, "compile_scope", "full") == "regional"
+            and self.config.action_mode in {"continuous", "both"}
+        ) or (getattr(self.config, "model_params_fp32", False) and self.config.action_mode == "continuous"):
+            # Regional mode compiles vision, connector, language and action blocks
+            # for both objectives. Joint training retains final text outputs for
+            # the discrete loss; only continuous mode drops those unused outputs.
+            # The monolithic loss wrapper below remains continuous-only.
+            import torch._dynamo.config as dynamo_config
+            import torch._functorch.config as functorch_config
+
+            dynamo_config.capture_dynamic_output_shape_ops = True
+            # forward() owns BF16 autocast; the trainer calls backward outside it.
+            functorch_config.backward_pass_autocast = "off"
+            options = {
+                "emulate_precision_casts": True,
+                # Preserve eager ViT MLP strides and BF16 rounding.
+                "comprehensive_padding": False,
+                "shape_padding": False,
+                "eager_numerics.division_rounding": True,
+                "fallback_random": True,
+            }
+            if getattr(self.config, "compile_scope", "full") == "regional":
+                self._native_norm_module_names = preserve_native_norms(self)
+                backbone = self._backbone()
+                targets: list[tuple[str, torch.nn.Module]] = []
+                for prefix, modules in (
+                    ("vision", backbone.vision_backbone.image_vit.transformer.resblocks),
+                    ("language", backbone.transformer.blocks),
+                    ("action", backbone.action_expert.blocks),
+                ):
+                    targets.extend((f"{prefix}.{i}", module) for i, module in enumerate(modules))
+                targets.extend(
+                    (f"connector.{name}", getattr(backbone.vision_backbone, name))
+                    for name in ("image_pooling_2d", "image_projector")
+                )
+                for _, module in targets:
+                    module.compile(backend="inductor", fullgraph=False, options=options)
+                self._compiled_module_names = tuple(name for name, _ in targets)
+            else:
+                self._compute_continuous_flow_loss = torch.compile(  # type: ignore[method-assign]
+                    self._compute_continuous_flow_loss,
+                    backend="inductor",
+                    fullgraph=False,
+                    options=options,
+                )
+                self._compiled_module_names = ("joint_flow_training",)
+            self._compile_applied = True
+            logger.info(
+                "Enabled MolmoAct2 %s training compilation.", getattr(self.config, "compile_scope", "full")
+            )
+            return
         compile_options = {"emulate_precision_casts": True}
         compile_kwargs = {
             "backend": "inductor",
@@ -1300,6 +1359,28 @@ class MolmoAct2Policy(PreTrainedPolicy):
             return time_conditioning(timesteps)
         return action_expert.time_embed(timesteps)
 
+    def _compute_continuous_flow_loss(
+        self,
+        *,
+        batch: dict[str, Tensor],
+        model_inputs: dict[str, Tensor],
+        timesteps: Tensor | None = None,
+        noise: Tensor | None = None,
+        reduction: str = "mean",
+    ) -> Tensor:
+        # Compile only the result consumed by continuous training. Returning
+        # unused differentiable hidden states across an AOTAutograd boundary
+        # materializes zero gradients for otherwise-unused text parameters,
+        # changing Adam's None-gradient/weight-decay semantics.
+        return self._compute_flow_matching_loss_joint_per_layer(
+            batch=batch,
+            model_inputs=model_inputs,
+            timesteps=timesteps,
+            noise=noise,
+            reduction=reduction,
+            return_hidden_states=False,
+        )[0]
+
     def _compute_flow_matching_loss_joint_per_layer(
         self,
         *,
@@ -1308,7 +1389,8 @@ class MolmoAct2Policy(PreTrainedPolicy):
         timesteps: Tensor | None = None,
         noise: Tensor | None = None,
         reduction: str = "mean",
-    ) -> tuple[Tensor, Tensor]:
+        return_hidden_states: bool = True,
+    ) -> tuple[Tensor, Tensor | None]:
         if reduction not in {"mean", "none"}:
             raise ValueError(f"Unsupported reduction={reduction!r}. Expected 'mean' or 'none'.")
         backbone = self._backbone()
@@ -1328,6 +1410,17 @@ class MolmoAct2Policy(PreTrainedPolicy):
             noise=noise,
         )
         num_flow_timesteps = max(1, int(self.config.num_flow_timesteps))
+        # Avoid F-fold materialization of every layer's language K/V under
+        # whole-model compilation. Keep dropout-bearing cross attention on the
+        # original layout so its RNG-to-query assignment remains unchanged.
+        share_flow_kv = (
+            (
+                getattr(self.config, "model_params_fp32", False)
+                or getattr(self.config, "compile_scope", "full") == "regional"
+            )
+            and num_flow_timesteps > 1
+            and all(block.cross_attn.attn_dropout == 0 for block in action_expert.blocks)
+        )
         batch_size = int(actions.shape[0])
         device = actions.device
         xt_flat = xt.reshape(batch_size * num_flow_timesteps, actions.shape[1], actions.shape[2])
@@ -1376,7 +1469,8 @@ class MolmoAct2Policy(PreTrainedPolicy):
             batch_size,
             action_compute_dtype,
         )
-        cross_mask = _expand_mask(cross_mask, num_flow_timesteps)
+        if not share_flow_kv:
+            cross_mask = _expand_mask(cross_mask, num_flow_timesteps)
         self_mask = action_expert._build_self_attention_mask(
             action_attention_mask,
             actions.shape[1],
@@ -1426,6 +1520,15 @@ class MolmoAct2Policy(PreTrainedPolicy):
                 "cache_position": cache_position,
                 "collect_layer_kv_states": True,
             }
+            if (
+                getattr(self.config, "compile_scope", "full") == "regional"
+                and not return_hidden_states
+                and layer_idx == int(transformer.config.num_hidden_layers) - 1
+            ):
+                # Exclude unused final text output from the AOT boundary. Otherwise
+                # AOT can materialize zero gradients where eager leaves None and
+                # Adam would update parameters that should have been skipped.
+                decoder_kwargs["return_hidden_states"] = False
             if use_gradient_checkpointing:
                 # The surrounding checkpoint covers the paired text+action
                 # layer. Bypass only Transformers' per-text-layer checkpoint
@@ -1451,11 +1554,11 @@ class MolmoAct2Policy(PreTrainedPolicy):
             k_norm = action_block.cross_attn.k_norm
             if k_norm is not None:
                 k_ctx = k_norm(k_ctx.transpose(1, 2)).transpose(1, 2)
-            if num_flow_timesteps != 1:
+            if num_flow_timesteps != 1 and not share_flow_kv:
                 k_ctx = _expand_mask(k_ctx, num_flow_timesteps)
                 v_ctx = _expand_mask(v_ctx, num_flow_timesteps)
 
-            if self.config.compile_model and use_gradient_checkpointing:
+            if self.config.compile_model and use_gradient_checkpointing and not torch.compiler.is_compiling():
                 _mark_action_context_dynamic(k_ctx, v_ctx, cross_mask)
 
             next_action_hidden = action_block(
@@ -1487,7 +1590,8 @@ class MolmoAct2Policy(PreTrainedPolicy):
             else:
                 hidden_states, action_hidden = run_layer(layer_idx, hidden_states, action_hidden)
 
-        hidden_states = transformer.ln_f(hidden_states)
+        # Keep unused text outputs out of graph-break continuation outputs too.
+        hidden_states = transformer.ln_f(hidden_states) if return_hidden_states else None
         pred_velocity = action_expert.final_layer(action_hidden, conditioning)
         if valid_action is not None:
             pred_velocity = pred_velocity * valid_action
@@ -1908,6 +2012,26 @@ class MolmoAct2Policy(PreTrainedPolicy):
         with self._autocast_context():
             return self._forward_impl(batch, reduction=reduction)
 
+    def _prepare_compiled_training_cache(self, model_inputs: dict[str, Tensor]) -> None:
+        """Initialize static RoPE buffers before Dynamo captures the training graph."""
+        if getattr(self, "_compiled_module_names", ()) != ("joint_flow_training",) and not (
+            getattr(self.config, "compile_scope", "full") == "regional" and self._compile_applied
+        ):
+            return
+        reference = model_inputs.get("input_ids")
+        if reference is None:
+            reference = model_inputs["inputs_embeds"]
+        transformer = self._backbone().transformer
+        if transformer.config.rope_scaling_layers is not None:
+            embeddings = transformer.rotary_embs.values()
+        else:
+            embeddings = (transformer.rotary_emb,)
+        for embedding in embeddings:
+            embedding.prepare_rope_cache(
+                device=reference.device,
+                max_seq_len=embedding.config.max_position_embeddings or reference.shape[1],
+            )
+
     def _forward_impl(
         self,
         batch: dict[str, Tensor],
@@ -1917,6 +2041,7 @@ class MolmoAct2Policy(PreTrainedPolicy):
         if reduction not in {"mean", "none"}:
             raise ValueError(f"Unsupported reduction={reduction!r}. Expected 'mean' or 'none'.")
         model_inputs = self._model_inputs(batch)
+        self._prepare_compiled_training_cache(model_inputs)
         losses: list[Tensor] = []
         metrics: dict[str, Any] = {}
 
@@ -1939,8 +2064,16 @@ class MolmoAct2Policy(PreTrainedPolicy):
                 metrics["discrete_z_loss"] = discrete_z_loss.detach().float().mean().item()
 
         elif self.config.action_mode == "continuous":
-            flow_loss, _ = self._compute_flow_matching_loss_joint_per_layer(
-                batch=batch,
+            # Raw camera tensors/metadata have already been processed into
+            # model_inputs. Exclude them from Dynamo's input guards; camera
+            # resolutions may differ even when model input shapes are equal.
+            flow_batch = {
+                key: batch[key]
+                for key in (ACTION, "action_dim_is_pad", "action_horizon_is_pad")
+                if key in batch
+            }
+            flow_loss = self._compute_continuous_flow_loss(
+                batch=flow_batch,
                 model_inputs=model_inputs,
                 reduction=reduction,
             )
